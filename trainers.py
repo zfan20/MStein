@@ -190,6 +190,242 @@ class Trainer:
         return rating_pred
 
 
+class WDMSASRecModelTrainer(Trainer):
+    def __init__(self, model,
+                 train_dataloader,
+                 eval_dataloader,
+                 test_dataloader,
+                 args):
+        super(WDMSASRecModelTrainer, self).__init__(
+            model,
+            train_dataloader,
+            eval_dataloader,
+            test_dataloader,
+            args
+        )
+        self.cf_criterion = WassersteinNCELoss(self.args.temperature, self.device)
+        print("self.cf_criterion:", self.cf_criterion.__class__.__name__)
+
+    def eval_analysis(self, dataloader, user_seq, args):
+        rec_data_iter = tqdm(enumerate(dataloader),
+                                  desc=f"Recommendation Test Analysis",
+                                  total=len(dataloader),
+                                  bar_format="{l_bar}{r_bar}")
+        #rec_data_iter = dataloader
+
+        Ks = [1, 5, 10, 15, 20, 40]
+        item_freq = defaultdict(int)
+        train = {}
+        for user_id, seq in enumerate(user_seq):
+            train_seq = seq[:-2]
+            train[user_id] = train_seq
+            for itemid in train_seq:
+                item_freq[itemid] += 1
+        freq_quantiles = np.array([3, 7, 20, 50])
+        items_in_freqintervals = [[] for _ in range(len(freq_quantiles)+1)]
+        for item, freq_i in item_freq.items():
+            interval_ind = -1
+            for quant_ind, quant_freq in enumerate(freq_quantiles):
+                if freq_i <= quant_freq:
+                    interval_ind = quant_ind
+                    break
+            if interval_ind == -1:
+                interval_ind = len(items_in_freqintervals) - 1
+            items_in_freqintervals[interval_ind].append(item)
+
+
+        self.model.eval()
+        all_pos_items_ranks = defaultdict(list)
+        pred_list = None
+        with torch.no_grad():
+            for i, batch in rec_data_iter:
+            #i = 0
+            #for batch in rec_data_iter:
+                # 0. batch_data will be sent into the device(GPU or cpu)
+                batch = tuple(t.to(self.device) for t in batch)
+                user_ids, input_ids, target_pos, target_neg, answers = batch
+                recommend_output = self.model.transformer_encoder(input_ids)
+
+                recommend_output = recommend_output[:, -1, :]
+
+                rating_pred = self.predict_full(recommend_output)
+
+                rating_pred = rating_pred.cpu().data.numpy().copy()
+                batch_user_index = user_ids.cpu().numpy()
+                rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
+
+                batch_pred_list = np.argsort(-rating_pred, axis=1)
+                pos_items = answers.cpu().data.numpy()
+
+                pos_ranks = np.where(batch_pred_list==pos_items)[1]+1
+                for each_pos_item, each_rank in zip(pos_items, pos_ranks):
+                    all_pos_items_ranks[each_pos_item[0]].append(each_rank)
+
+                partial_batch_pred_list = batch_pred_list[:, :40]
+
+                if i == 0:
+                    pred_list = partial_batch_pred_list
+                    answer_list = answers.cpu().data.numpy()
+                else:
+                    pred_list = np.append(pred_list, partial_batch_pred_list, axis=0)
+                    answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
+                #i += 1
+            scores, result_info, [recall_dict_list, ndcg_dict_list, mrr_dict] = self.get_full_sort_score('best', answer_list, pred_list)
+
+            get_user_performance_perpopularity(train, [recall_dict_list, ndcg_dict_list, mrr_dict], Ks)
+            get_item_performance_perpopularity(items_in_freqintervals, all_pos_items_ranks, Ks, freq_quantiles, args.item_size)
+            return scores, result_info, None
+
+    def _one_pair_contrastive_learning(self, inputs):
+        '''
+        contrastive learning given one pair sequences (batch)
+        inputs: [batch1_augmented_data, batch2_augmentated_data]
+        '''
+        activation = nn.ELU()
+        cl_batch = torch.cat(inputs, dim=0)
+        cl_batch = cl_batch.to(self.device)
+        cl_sequence_output = self.model.transformer_encoder(cl_batch)
+        dist_dim_size = cl_sequence_output.shape[-1]//2
+        cl_mean_sequence_output, cl_cov_sequence_output = torch.split(cl_sequence_output, dist_dim_size, dim=-1)
+        cl_cov_sequence_output = activation(cl_cov_sequence_output)+1
+        # cf_sequence_output = cf_sequence_output[:, -1, :]
+        cl_mean_sequence_flatten = cl_mean_sequence_output.reshape(cl_batch.shape[0], -1)
+        cl_cov_sequence_flatten = cl_cov_sequence_output.reshape(cl_batch.shape[0], -1)
+        # cf_output = self.projection(cf_sequence_flatten)
+        batch_size = cl_batch.shape[0]//2
+        cl_mean_output_slice = torch.split(cl_mean_sequence_flatten, batch_size)
+        cl_cov_output_slice = torch.split(cl_cov_sequence_flatten, batch_size)
+        cl_loss = self.cf_criterion(cl_mean_output_slice[0], cl_cov_output_slice[0],
+                                cl_mean_output_slice[1], cl_cov_output_slice[1])
+        return cl_loss
+
+    def iteration(self, epoch, dataloader, full_sort=True, train=True):
+
+        str_code = "train" if train else "test"
+
+        # Setting the tqdm progress bar
+
+        if train:
+            self.model.train()
+            rec_avg_loss = 0.0
+            cl_individual_avg_losses = [0.0 for i in range(self.total_augmentaion_pairs)]
+            cl_sum_avg_loss = 0.0
+            joint_avg_loss = 0.0
+
+            print(f"rec dataset length: {len(dataloader)}")
+            #rec_cf_data_iter = tqdm(enumerate(dataloader), total=len(dataloader))
+            rec_cf_data_iter = dataloader
+
+            for i, (rec_batch, cl_batches) in enumerate(rec_cf_data_iter):
+                '''
+                rec_batch shape: key_name x batch_size x feature_dim
+                cl_batches shape:
+                    list of n_views x batch_size x feature_dim tensors
+                '''
+                # 0. batch_data will be sent into the device(GPU or CPU)
+                rec_batch = tuple(t.to(self.device) for t in rec_batch)
+                _, input_ids, target_pos, target_neg, _ = rec_batch
+
+                # ---------- recommendation task ---------------#
+                sequence_output = self.model.transformer_encoder(input_ids)
+                rec_loss, auc = self.cross_entropy(sequence_output, target_pos, target_neg)
+
+                # ---------- contrastive learning task -------------#
+                cl_losses = []
+                for cl_batch in cl_batches:
+                    cl_loss = self._one_pair_contrastive_learning(cl_batch)
+                    cl_losses.append(cl_loss)
+
+                joint_loss = self.args.rec_weight * rec_loss
+                for cl_loss in cl_losses:
+                    joint_loss += self.args.cf_weight * cl_loss
+                self.optim.zero_grad()
+                joint_loss.backward()
+                self.optim.step()
+
+                rec_avg_loss += rec_loss.item()
+
+                for i, cl_loss in enumerate(cl_losses):
+                    cl_individual_avg_losses[i] += cl_loss.item()
+                    cl_sum_avg_loss += cl_loss.item()
+                joint_avg_loss += joint_loss.item()
+
+
+            post_fix = {
+                "epoch": epoch,
+                "rec_avg_loss": '{:.4f}'.format(rec_avg_loss / len(rec_cf_data_iter)),
+                "joint_avg_loss": '{:.4f}'.format(joint_avg_loss / len(rec_cf_data_iter)),
+                "cl_avg_loss": '{:.4f}'.format(cl_sum_avg_loss / (len(rec_cf_data_iter)*self.total_augmentaion_pairs)),
+            }
+            for i, cl_individual_avg_loss in enumerate(cl_individual_avg_losses):
+                post_fix['cl_pair_'+str(i)+'_loss'] = '{:.4f}'.format(cl_individual_avg_loss / len(rec_cf_data_iter))
+
+            if (epoch + 1) % self.args.log_freq == 0:
+                print(str(post_fix))
+
+            with open(self.args.log_file, 'a') as f:
+                f.write(str(post_fix) + '\n')
+
+        else:
+            #rec_data_iter = tqdm(enumerate(dataloader),
+            #                      desc="Recommendation EP_%s:%d" % (str_code, epoch),
+            #                      total=len(dataloader),
+            #                      bar_format="{l_bar}{r_bar}")
+            rec_data_iter = dataloader
+            self.model.eval()
+
+            pred_list = None
+
+            if full_sort:
+                answer_list = None
+                for i, batch in enumerate(rec_data_iter):
+                    # 0. batch_data will be sent into the device(GPU or cpu)
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers = batch
+                    recommend_output = self.model.transformer_encoder(input_ids)
+
+                    recommend_output = recommend_output[:, -1, :]
+                    # recommendation results
+
+                    rating_pred = self.predict_full(recommend_output)
+
+                    rating_pred = rating_pred.cpu().data.numpy().copy()
+                    batch_user_index = user_ids.cpu().numpy()
+                    rating_pred[self.args.train_matrix[batch_user_index].toarray() > 0] = 0
+                    # reference: https://stackoverflow.com/a/23734295, https://stackoverflow.com/a/20104162
+                    # argpartition T: O(n)  argsort O(nlogn)
+                    ind = np.argpartition(rating_pred, -40)[:, -40:]
+                    arr_ind = rating_pred[np.arange(len(rating_pred))[:, None], ind]
+                    arr_ind_argsort = np.argsort(arr_ind)[np.arange(len(rating_pred)), ::-1]
+                    batch_pred_list = ind[np.arange(len(rating_pred))[:, None], arr_ind_argsort]
+
+                    if i == 0:
+                        pred_list = batch_pred_list
+                        answer_list = answers.cpu().data.numpy()
+                    else:
+                        pred_list = np.append(pred_list, batch_pred_list, axis=0)
+                        answer_list = np.append(answer_list, answers.cpu().data.numpy(), axis=0)
+                return self.get_full_sort_score(epoch, answer_list, pred_list)
+
+            else:
+                for i, batch in enumerate(rec_data_iter):
+                    # 0. batch_data will be sent into the device(GPU or cpu)
+                    batch = tuple(t.to(self.device) for t in batch)
+                    user_ids, input_ids, target_pos, target_neg, answers, sample_negs = batch
+                    recommend_output = self.model.finetune(input_ids)
+                    test_neg_items = torch.cat((answers, sample_negs), -1)
+                    recommend_output = recommend_output[:, -1, :]
+
+                    test_logits = self.predict_sample(recommend_output, test_neg_items)
+                    test_logits = test_logits.cpu().detach().numpy().copy()
+                    if i == 0:
+                        pred_list = test_logits
+                    else:
+                        pred_list = np.append(pred_list, test_logits, axis=0)
+
+                return self.get_sample_scores(epoch, pred_list)
+
+
 class CoSeRecTrainer(Trainer):
 
     def __init__(self, model,
@@ -218,7 +454,7 @@ class CoSeRecTrainer(Trainer):
         item_freq = defaultdict(int)
         train = {}
         for user_id, seq in enumerate(user_seq):
-            train_seq = seq[:-3]
+            train_seq = seq[:-2]
             train[user_id] = train_seq
             for itemid in train_seq:
                 item_freq[itemid] += 1
@@ -443,7 +679,7 @@ class FinetuneTrainer(Trainer):
         item_freq = defaultdict(int)
         user_freq = defaultdict(int)
         for user_id, seq in enumerate(user_seq):
-            train_seq = seq[:-3]
+            train_seq = seq[:-2]
             train[user_id] = len(train_seq)
             for itemid in train_seq:
                 item_freq[itemid] += 1
@@ -498,7 +734,7 @@ class FinetuneTrainer(Trainer):
         item_freq = defaultdict(int)
         train = {}
         for user_id, seq in enumerate(user_seq):
-            train_seq = seq[:-3]
+            train_seq = seq[:-2]
             train[user_id] = train_seq
             for itemid in train_seq:
                 item_freq[itemid] += 1
@@ -924,7 +1160,7 @@ class CoDistSAModelTrainer(Trainer):
         item_freq = defaultdict(int)
         user_freq = defaultdict(int)
         for user_id, seq in enumerate(user_seq):
-            train_seq = seq[:-3]
+            train_seq = seq[:-2]
             user_freq[user_id] = len(train_seq)
             for itemid in train_seq:
                 item_freq[itemid] += 1
@@ -985,7 +1221,7 @@ class CoDistSAModelTrainer(Trainer):
         item_freq = defaultdict(int)
         train = {}
         for user_id, seq in enumerate(user_seq):
-            train_seq = seq[:-3]
+            train_seq = seq[:-2]
             train[user_id] = train_seq
             for itemid in train_seq:
                 item_freq[itemid] += 1

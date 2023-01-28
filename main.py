@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader, RandomSampler, SequentialSampler
 
 from datasets import RecWithContrastiveLearningDataset, SASRecDataset, RecWithModeAugContrastiveLearningDataset, RecWithCL4RecContrastiveLearningDataset
 
-from trainers import CoSeRecTrainer, FinetuneTrainer, DistSAModelTrainer, CoDistSAModelTrainer
+from trainers import CoSeRecTrainer, FinetuneTrainer, DistSAModelTrainer, CoDistSAModelTrainer, WDMSASRecModelTrainer
 from models import SASRecModel, OfflineItemSimilarity, OnlineItemSimilarity, DistSAModel, WassersteinOnlineItemSimilarity
 from utils import EarlyStopping, get_user_seqs, get_item2attribute_json, check_path, set_seed
 from trainers import SRMATrainer
@@ -123,6 +123,12 @@ def main():
                         The probability ranges from [0, hidden_dropout_prob]")
     parser.add_argument("--en_weight", type=float, default=0.1, \
                         help="weight of encoder complementing ")
+
+
+    parser.add_argument("--tau", type=float, default=0.1, help='tau')
+    parser.add_argument("--ssl", type=str, default='us', help='ssl way')
+    parser.add_argument("--lmd", type=float, default=0.1, help='lmd')
+    parser.add_argument("--lmd_sem", type=float, default=0.1, help='lmd_sem')
 
 
     args = parser.parse_args()
@@ -299,6 +305,23 @@ def main():
         test_sampler = SequentialSampler(test_dataset)
         test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
         trainer = CoDistSAModelTrainer(model, train_dataloader, eval_dataloader,
+                              test_dataloader, args)
+    elif args.model_name == 'WDMSASRecModel':
+        model = SASRecModel(args=args)
+        train_dataset = RecWithContrastiveLearningDataset(args,
+                                        user_seq[:int(len(user_seq)*args.training_data_ratio)], \
+                                        data_type='train')
+        train_sampler = RandomSampler(train_dataset)
+        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.batch_size)
+
+        eval_dataset = RecWithContrastiveLearningDataset(args, user_seq, data_type='valid')
+        eval_sampler = SequentialSampler(eval_dataset)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=args.batch_size)
+
+        test_dataset = RecWithContrastiveLearningDataset(args, user_seq, data_type='test')
+        test_sampler = SequentialSampler(test_dataset)
+        test_dataloader = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.batch_size)
+        trainer = WDMSASRecModelTrainer(model, train_dataloader, eval_dataloader,
                               test_dataloader, args)
 
 
