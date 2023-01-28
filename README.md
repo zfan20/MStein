@@ -6,7 +6,7 @@ Example code:
 
 Please cite our paper if you use the code:
 ```bibtex
-@article{fan2023mstein,
+@inproceedings{fan2023mstein,
   title={Mutual Wasserstein Discrepancy Minimization for Sequential Recommendation},
   author={Fan, Ziwei and Liu, Zhiwei and Peng, Hao and Yu, Philip S},
   journal={WWW},
