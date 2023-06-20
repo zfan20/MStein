@@ -2,6 +2,9 @@
 This is the implementation for the paper:
 TheWebConf'23. You may find it on [Arxiv](https://arxiv.org/pdf/2301.12197.pdf)
 
+### Update on the theoretical connection between KL divergence and mutual information
+The mutual information is not asymmetric but symmetric. I have updated the correct version to arXiv by removing the asymmetric deficiency. However, the paper's conclusions and observations are still valid even without the asymmetric deficiency. Thanks to a reader for pointing out this mistake.
+
 Example code:
 `python main.py --model_name=CoDistSAModel --data_name=Beauty --lr=0.001 --hidden_size=64 --max_seq_length=50 --hidden_dropout_prob=0.1 --num_hidden_layers=1 --weight_decay=0.0 --num_attention_heads=2 --attention_probs_dropout_prob=0.0 --substitute_rate=0.5 --insert_rate=0.3 --augment_threshold=16 --augmentation_warm_up_epoches=160 --cf_weight=0.005 --batch_size=1024 --pvn_weight=0.01 --temperature=1e-06`
 
